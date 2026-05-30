@@ -236,6 +236,8 @@ class App {
   void selectTypographyTuningItem(uint32_t nowMs);
   void cycleTypographyPreviewSample(int direction);
   void rebuildSettingsMenuItems();
+  void maybeStartBackgroundSync(uint32_t nowMs);
+  void stopBackgroundSync();
   void applyPacingSettings();
   void maybeAutoCheckForUpdates(uint32_t nowMs);
   bool startBackgroundOtaCheck(const OtaUpdater::Config &config);
@@ -527,6 +529,8 @@ class App {
   bool focusTimerCancelHoldTriggered_ = false;
   bool otaCheckInProgress_ = false;
   bool otaUpdatePromptPending_ = false;
+  bool backgroundSyncEnabled_ = false;
+  bool backgroundSyncStarted_ = false;
   bool contextViewVisible_ = false;
   bool contextPreviewWindowValid_ = false;
   bool wpmFeedbackVisible_ = false;

@@ -10,6 +10,7 @@ class CompanionSyncManager {
   struct Config {
     String wifiSsid;
     String wifiPassword;
+    bool stationOnly = false;
   };
 
   bool begin(const Config &config);
@@ -92,4 +93,5 @@ class CompanionSyncManager {
   NetworkMode networkMode_ = NetworkMode::None;
   bool active_ = false;
   bool serverStarted_ = false;
+  bool stationConnecting_ = false;
 };

@@ -48,6 +48,7 @@ constexpr const char *kPrefTypographyGuideGap = "type_gap";
 constexpr const char *kPrefWifiSsid = "wifi_ssid";
 constexpr const char *kPrefWifiPass = "wifi_pass";
 constexpr const char *kPrefSyncToken = "sync_token";
+constexpr const char *kPrefBackgroundSync = "bg_sync";
 constexpr uint16_t kDefaultWpm = 300;
 constexpr uint16_t kMinWpm = 10;
 constexpr uint16_t kMaxWpm = 1000;
@@ -569,6 +570,11 @@ void CompanionSyncManager::update() {
   if (!active_ || !serverStarted_) {
     return;
   }
+  if (stationConnecting_ && WiFi.status() == WL_CONNECTED) {
+    stationConnecting_ = false;
+    if (MDNS.begin(kMdnsName)) MDNS.addService("http", "tcp", 80);
+    Serial.printf("[sync] background station up ip=%s\n", ipToString(WiFi.localIP()).c_str());
+  }
   server_.handleClient();
 }
 
@@ -667,6 +673,19 @@ void CompanionSyncManager::handleNotFoundStatic() {
 }
 
 bool CompanionSyncManager::startNetwork(const Config &config) {
+  stationConnecting_ = false;
+
+  if (config.stationOnly) {
+    if (config.wifiSsid.length() == 0) return false;
+    networkSsid_ = config.wifiSsid;
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(config.wifiSsid.c_str(), config.wifiPassword.c_str());
+    networkMode_ = NetworkMode::Station;   // baseUrl() -> LAN IP
+    stationConnecting_ = true;             // mDNS + log finished in update() once connected
+    Serial.println("[sync] background station connecting (non-blocking)");
+    return true;                           // do NOT busy-wait, no softAP
+  }
+
   const String apSsid = "RSVP-Nano-" + deviceSuffix();
   networkSsid_ = apSsid;
 
@@ -764,7 +783,8 @@ bool CompanionSyncManager::startServer() {
   server_.begin();
   serverStarted_ = true;
 
-  if (networkMode_ == NetworkMode::Station && MDNS.begin(kMdnsName)) {
+  if (networkMode_ == NetworkMode::Station && WiFi.status() == WL_CONNECTED &&
+      MDNS.begin(kMdnsName)) {
     MDNS.addService("http", "tcp", 80);
   }
   return true;
@@ -1179,6 +1199,8 @@ String CompanionSyncManager::settingsJson() {
   body += ",\"language\":" + String(language);
   body += ",\"phantomWords\":" +
           String(preferences_.getBool(kPrefPhantomWords, true) ? "true" : "false");
+  body += ",\"backgroundSync\":" +
+          String(preferences_.getBool(kPrefBackgroundSync, false) ? "true" : "false");
   body += ",\"fontSizeIndex\":" + String(fontSize);
   body += "}";
   body += ",\"typography\":{";
@@ -1371,6 +1393,9 @@ bool CompanionSyncManager::applySettingsJson(const String &body, String &error) 
       return false;
     }
     preferences_.putUChar(kPrefTypographyGuideGap, static_cast<uint8_t>(intValue));
+  }
+  if (readJsonBool(body, "backgroundSync", boolValue)) {
+    preferences_.putBool(kPrefBackgroundSync, boolValue);
   }
 
   return true;

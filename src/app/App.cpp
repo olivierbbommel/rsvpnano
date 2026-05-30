@@ -178,8 +178,9 @@ constexpr size_t kSettingsPacingResetIndex = 7;
 constexpr size_t kWifiSettingsNetworkIndex = 1;
 constexpr size_t kWifiSettingsChooseIndex = 2;
 constexpr size_t kWifiSettingsAutoUpdateIndex = 3;
-constexpr size_t kWifiSettingsForgetIndex = 4;
-constexpr size_t kWifiSettingsOtaOwnerIndex = 5;
+constexpr size_t kWifiSettingsBackgroundSyncIndex = 4;
+constexpr size_t kWifiSettingsForgetIndex = 5;
+constexpr size_t kWifiSettingsOtaOwnerIndex = 6;
 
 constexpr size_t kBookPickerBackIndex = 0;
 constexpr size_t kChapterPickerBackIndex = 0;
@@ -223,6 +224,7 @@ constexpr const char *kPrefTypographyGuideGap = "type_gap";
 constexpr const char *kPrefRecentSeq = "seq";
 constexpr const char *kPrefWifiSsid = "wifi_ssid";
 constexpr const char *kPrefWifiPass = "wifi_pass";
+constexpr const char *kPrefBackgroundSync = "bg_sync";
 constexpr const char *kPrefOtaAuto = "ota_auto";
 constexpr const char *kPrefOtaOwner = "ota_owner";
 constexpr size_t kReaderFontSizeCount = 3;
@@ -767,6 +769,8 @@ void App::begin() {
     }
   }
 
+  backgroundSyncEnabled_ = preferences_.getBool(kPrefBackgroundSync, false);
+
   maybeAutoCheckForUpdates(bootStartedMs_);
   Serial.printf("[app] WPM=%u interval=%lu ms\n", reader_.wpm(),
                 static_cast<unsigned long>(reader_.wordIntervalMs()));
@@ -785,6 +789,14 @@ void App::update(uint32_t nowMs) {
   }
   if (powerOffStarted_) {
     return;
+  }
+
+  if (backgroundSyncEnabled_) {
+    if (backgroundSyncStarted_) {
+      companionSync_.update();
+    } else {
+      maybeStartBackgroundSync(nowMs);
+    }
   }
 
   const bool batteryChanged = updateBatteryStatus(nowMs);
@@ -2864,6 +2876,13 @@ void App::selectWifiSettingsItem(uint32_t nowMs) {
       rebuildSettingsMenuItems();
       renderSettings();
       return;
+    case kWifiSettingsBackgroundSyncIndex:
+      backgroundSyncEnabled_ = !backgroundSyncEnabled_;
+      preferences_.putBool(kPrefBackgroundSync, backgroundSyncEnabled_);
+      if (!backgroundSyncEnabled_) stopBackgroundSync();
+      rebuildSettingsMenuItems();
+      renderSettings();
+      return;
     case kWifiSettingsForgetIndex:
       preferences_.remove(kPrefWifiSsid);
       preferences_.remove(kPrefWifiPass);
@@ -3392,6 +3411,7 @@ void App::rebuildSettingsMenuItems() {
     settingsMenuItems_.push_back("Network: " + storedOrFallbackLabel(configuredWifiSsid(), "Not set"));
     settingsMenuItems_.push_back("Choose network");
     settingsMenuItems_.push_back("Auto OTA: " + String(otaAutoCheckEnabled() ? "On" : "Off"));
+    settingsMenuItems_.push_back("Background sync: " + onOffLabel(backgroundSyncEnabled_));
     settingsMenuItems_.push_back("Forget network");
     settingsMenuItems_.push_back("OTA Owner: " + otaOwnerLabel());
   }
@@ -3478,6 +3498,7 @@ bool App::otaAutoCheckEnabled() {
 
 void App::maybeAutoCheckForUpdates(uint32_t nowMs) {
   (void)nowMs;
+  if (backgroundSyncEnabled_) return;  // background sync and the OTA auto-check can't share the single radio
   OtaUpdater::Config otaConfig = preferredOtaConfig();
   if (!otaConfig.autoCheck || !otaUpdater_.isConfigured(otaConfig)) {
     return;
@@ -3485,6 +3506,33 @@ void App::maybeAutoCheckForUpdates(uint32_t nowMs) {
 
   Serial.println("[ota] auto-check enabled");
   startBackgroundOtaCheck(otaConfig);
+}
+
+void App::maybeStartBackgroundSync(uint32_t nowMs) {
+  if (backgroundSyncStarted_ || companionSync_.active()) return;
+  if (otaCheckInProgress_) return;                       // don't race the OTA radio task
+  if (state_ == AppState::CompanionSync || state_ == AppState::UsbTransfer ||
+      state_ == AppState::Sleeping) return;              // foreground modes own the radio
+  if (nowMs - bootStartedMs_ < 1500) return;             // let boot settle past the splash
+  if (configuredWifiSsid().isEmpty()) return;            // no home Wi-Fi -> nothing to do
+  OtaUpdater::Config wifi = preferredOtaConfig();
+  CompanionSyncManager::Config cfg;
+  cfg.wifiSsid = wifi.wifiSsid;
+  cfg.wifiPassword = wifi.wifiPassword;
+  cfg.stationOnly = true;
+  if (companionSync_.begin(cfg)) {
+    backgroundSyncStarted_ = true;
+    Serial.println("[app] background sync started");
+  }
+}
+
+void App::stopBackgroundSync() {
+  if (!backgroundSyncStarted_) return;
+  companionSync_.end();
+  preferences_.end();                          // companionSync_.end() closed the shared "rsvp" handle
+  preferences_.begin(kPrefsNamespace, false);  // re-open App's handle (mirror exitCompanionSync)
+  backgroundSyncStarted_ = false;
+  Serial.println("[app] background sync stopped");
 }
 
 bool App::startBackgroundOtaCheck(const OtaUpdater::Config &config) {
@@ -4023,6 +4071,7 @@ void App::selectUpdateConfirmItem(uint32_t nowMs) {
 }
 
 void App::enterCompanionSync(uint32_t nowMs) {
+  if (backgroundSyncStarted_) stopBackgroundSync();
   if (blockNetworkActionForOtaCheck("Sync", nowMs)) {
     return;
   }
@@ -4728,6 +4777,7 @@ void App::enterSleep(uint32_t nowMs) {
   touch_.end();
   touchInitialized_ = false;
 
+  stopBackgroundSync();
   BoardConfig::lightSleepUntilBootButton();
   wakeFromSleep();
 }
