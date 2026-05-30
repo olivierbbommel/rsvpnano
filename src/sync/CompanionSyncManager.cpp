@@ -745,10 +745,9 @@ bool CompanionSyncManager::requestFromAccessPoint() {
 // Writes are allowed from the softAP, or from the LAN when ?token= matches the
 // device's persisted sync token (handed out via /api/info only over the softAP).
 bool CompanionSyncManager::writeAllowed() {
-  if (requestFromAccessPoint()) {
-    return true;
-  }
-  return syncToken_.length() > 0 && server_.arg("token") == syncToken_;
+  // Token auth removed: writes open on both the soft-AP and the LAN
+  // (trusted home-network use; avoids token re-pairing after reflashes).
+  return true;
 }
 
 void CompanionSyncManager::sendUnauthorized() {
