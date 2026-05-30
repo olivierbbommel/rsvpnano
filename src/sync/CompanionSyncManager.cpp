@@ -47,6 +47,7 @@ constexpr const char *kPrefTypographyGuideWidth = "type_wid";
 constexpr const char *kPrefTypographyGuideGap = "type_gap";
 constexpr const char *kPrefWifiSsid = "wifi_ssid";
 constexpr const char *kPrefWifiPass = "wifi_pass";
+constexpr const char *kPrefSyncToken = "sync_token";
 constexpr uint16_t kDefaultWpm = 300;
 constexpr uint16_t kMinWpm = 10;
 constexpr uint16_t kMaxWpm = 1000;
@@ -522,7 +523,6 @@ String rsvpMetadataValueFromLine(const String &line, const char *directive, bool
 CompanionSyncManager *CompanionSyncManager::instance_ = nullptr;
 
 bool CompanionSyncManager::begin(const Config &config) {
-  (void)config;
   if (active_) {
     return true;
   }
@@ -533,7 +533,16 @@ bool CompanionSyncManager::begin(const Config &config) {
   statusLine2_ = "Preparing Wi-Fi";
   preferences_.begin(kPrefsNamespace, false);
 
-  const bool networkReady = startAccessPoint();
+  // Stable per-device token (persisted) that authorizes writes over the LAN.
+  syncToken_ = preferences_.getString(kPrefSyncToken, "");
+  if (syncToken_.isEmpty()) {
+    char tokenBuf[9];
+    snprintf(tokenBuf, sizeof(tokenBuf), "%08x", static_cast<uint32_t>(esp_random()));
+    syncToken_ = tokenBuf;
+    preferences_.putString(kPrefSyncToken, syncToken_);
+  }
+
+  const bool networkReady = startNetwork(config);
   if (!networkReady) {
     statusLine1_ = "Wi-Fi failed";
     statusLine2_ = "";
@@ -657,20 +666,84 @@ void CompanionSyncManager::handleNotFoundStatic() {
   }
 }
 
-bool CompanionSyncManager::startAccessPoint() {
-  const String ssid = "RSVP-Nano-" + deviceSuffix();
-  statusLine1_ = "Sync Wi-Fi";
-  statusLine2_ = ssid;
-  networkSsid_ = ssid;
-  WiFi.mode(WIFI_AP);
-  if (!WiFi.softAP(ssid.c_str())) {
+bool CompanionSyncManager::startNetwork(const Config &config) {
+  const String apSsid = "RSVP-Nano-" + deviceSuffix();
+  networkSsid_ = apSsid;
+
+  // If home Wi-Fi is saved, join it (AP+STA) so the companion API is reachable on
+  // your LAN with no network switching. The softAP stays up as a fallback and for
+  // first-time setup.
+  bool stationUp = false;
+  int apChannel = 1;
+  if (config.wifiSsid.length() > 0) {
+    statusLine1_ = "Joining Wi-Fi";
+    statusLine2_ = config.wifiSsid;
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.begin(config.wifiSsid.c_str(), config.wifiPassword.c_str());
+    const uint32_t startMs = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - startMs < 12000) {
+      delay(200);
+    }
+    stationUp = WiFi.status() == WL_CONNECTED;
+    if (stationUp) {
+      apChannel = WiFi.channel();  // AP must share the STA channel (single radio)
+    }
+  } else {
+    WiFi.mode(WIFI_AP);
+  }
+
+  if (!WiFi.softAP(apSsid.c_str(), nullptr, apChannel)) {
     Serial.println("[sync] softAP failed");
     return false;
   }
 
-  networkMode_ = NetworkMode::AccessPoint;
-  Serial.printf("[sync] softAP ssid=%s ip=%s\n", ssid.c_str(), ipToString(WiFi.softAPIP()).c_str());
+  if (stationUp) {
+    networkMode_ = NetworkMode::Station;  // baseUrl() -> LAN IP; mDNS starts in startServer()
+    networkSsid_ = config.wifiSsid;
+    Serial.printf("[sync] AP+STA ap=%s sta_ip=%s\n", apSsid.c_str(),
+                  ipToString(WiFi.localIP()).c_str());
+  } else {
+    if (config.wifiSsid.length() > 0) {
+      WiFi.disconnect(false, false);  // station join failed -> AP only
+      WiFi.mode(WIFI_AP);
+    }
+    networkMode_ = NetworkMode::AccessPoint;
+    Serial.printf("[sync] softAP ssid=%s ip=%s\n", apSsid.c_str(),
+                  ipToString(WiFi.softAPIP()).c_str());
+  }
   return true;
+}
+
+// True when the current HTTP request arrived on the softAP interface (client IP is
+// inside the softAP /24). Joining the AP is treated as authorization; LAN clients
+// must instead present the sync token.
+bool CompanionSyncManager::requestFromAccessPoint() {
+  const IPAddress remote = server_.client().remoteIP();
+  const IPAddress ap = WiFi.softAPIP();
+  return remote[0] == ap[0] && remote[1] == ap[1] && remote[2] == ap[2];
+}
+
+// Writes are allowed from the softAP, or from the LAN when ?token= matches the
+// device's persisted sync token (handed out via /api/info only over the softAP).
+bool CompanionSyncManager::writeAllowed() {
+  if (requestFromAccessPoint()) {
+    return true;
+  }
+  return syncToken_.length() > 0 && server_.arg("token") == syncToken_;
+}
+
+void CompanionSyncManager::sendUnauthorized() {
+  server_.send(401, "application/json",
+               "{\"ok\":false,\"error\":\"Unauthorized: add ?token= (see device screen / soft-AP)\"}");
+}
+
+// The LAN write-token, exposed via /api/info ONLY to soft-AP clients so a device
+// elsewhere on your home network can't read it and gain write access.
+String CompanionSyncManager::infoTokenField() {
+  if (!requestFromAccessPoint()) {
+    return "";
+  }
+  return String("\"syncToken\":\"") + syncToken_ + "\",";
 }
 
 bool CompanionSyncManager::startServer() {
@@ -712,7 +785,7 @@ void CompanionSyncManager::handleInfo() {
                       "\"mode\":\"" + mode + "\"," +
                       "\"baseUrl\":\"" + jsonEscape(baseUrl()) + "\"," +
                       "\"networkSsid\":\"" + jsonEscape(networkSsid_) + "\"," +
-                      "\"pairingCode\":\"" + pairingCode_ + "\"," +
+                      "\"pairingCode\":\"" + pairingCode_ + "\"," + infoTokenField() +
                       "\"uploadPath\":\"/api/books\"" + "}";
   server_.send(200, "application/json", body);
 }
@@ -782,6 +855,11 @@ void CompanionSyncManager::handleSettings() {
     return;
   }
 
+  if (!writeAllowed()) {
+    sendUnauthorized();
+    return;
+  }
+
   const String body = server_.arg("plain");
   if (body.length() > kMaxSettingsPatchBytes) {
     server_.send(413, "application/json", "{\"ok\":false,\"error\":\"Settings payload too large\"}");
@@ -801,6 +879,11 @@ void CompanionSyncManager::handleSettings() {
 void CompanionSyncManager::handleWifi() {
   if (server_.method() == HTTP_GET) {
     server_.send(200, "application/json", wifiJson());
+    return;
+  }
+
+  if (!writeAllowed()) {
+    sendUnauthorized();
     return;
   }
 
@@ -831,6 +914,11 @@ void CompanionSyncManager::handleRssFeeds() {
     return;
   }
 
+  if (!writeAllowed()) {
+    sendUnauthorized();
+    return;
+  }
+
   String error;
   if (!writeRssFeedsJson(server_.arg("plain"), error)) {
     server_.send(400, "application/json",
@@ -858,6 +946,11 @@ void CompanionSyncManager::handleBooks() {
 }
 
 void CompanionSyncManager::handleBookDelete() {
+  if (!writeAllowed()) {
+    sendUnauthorized();
+    return;
+  }
+
   String requested = server_.arg("name");
   requested.trim();
   if (requested.isEmpty()) {
@@ -929,6 +1022,10 @@ void CompanionSyncManager::handleBookUpload() {
   HTTPUpload &upload = server_.upload();
 
   if (upload.status == UPLOAD_FILE_START) {
+    if (!writeAllowed()) {
+      uploadError_ = "Unauthorized";
+      return;
+    }
     String filename = sanitizeFilename(server_.arg("name"));
     if (filename.isEmpty()) {
       filename = sanitizeFilename(upload.filename);

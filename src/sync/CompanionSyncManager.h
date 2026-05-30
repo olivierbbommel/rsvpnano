@@ -43,7 +43,11 @@ class CompanionSyncManager {
   static void handleBookUploadStatic();
   static void handleNotFoundStatic();
 
-  bool startAccessPoint();
+  bool startNetwork(const Config &config);
+  bool requestFromAccessPoint();
+  bool writeAllowed();
+  void sendUnauthorized();
+  String infoTokenField();
   bool startServer();
   void stopServer();
   void handleInfo();
@@ -80,6 +84,7 @@ class CompanionSyncManager {
   String uploadTmpPath_;
   String uploadError_;
   String pairingCode_;
+  String syncToken_;
   String networkSsid_;
   Preferences preferences_;
   String statusLine1_ = "Idle";
